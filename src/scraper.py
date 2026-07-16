@@ -81,25 +81,40 @@ def scrape_deals(domain: str = "amazon.com", max_deals: int = 20, headless: bool
 
 def _extract_deals(page, domain: str, max_deals: int) -> list[Deal]:
     deals: dict[str, Deal] = {}
-    anchors = page.query_selector_all('a[href*="/dp/"], a[href*="/gp/product/"]')
+    
+    # 1. Target the actual deal cards directly instead of loose links
+    cards = page.query_selector_all('[data-testid="deal-card"]')
+    
+    # Fallback just in case Amazon India uses a different class today
+    if not cards:
+        cards = page.query_selector_all('div[class*="DealGridItem"]')
 
-    for anchor in anchors:
+    for card in cards:
         if len(deals) >= max_deals:
             break
+
+        # 2. Find the product link strictly INSIDE this specific card
+        anchor = card.query_selector('a[href*="/dp/"], a[href*="/gp/product/"]')
+        if not anchor:
+            continue
 
         href = anchor.get_attribute("href") or ""
         match = ASIN_RE.search(href)
         if not match:
             continue
+            
         asin = match.group(1)
         if asin in deals:
             continue
 
-        context = anchor.evaluate(_CLIMB_TO_CARD_JS, 6)
-        card_text = context.get("text", "")
-        image_url = context.get("image", "")
+        # 3. Extract text and image isolated to JUST this card
+        card_text = card.inner_text()
+        
+        img_element = card.query_selector('img')
+        image_url = img_element.get_attribute("src") if img_element else ""
 
         full_url = href if href.startswith("http") else f"https://www.{domain}{href}"
+        
         deals[asin] = Deal(
             asin=asin,
             title=_guess_title(card_text, anchor),
@@ -109,6 +124,36 @@ def _extract_deals(page, domain: str, max_deals: int) -> list[Deal]:
             original_price=_guess_original_price(card_text),
             discount_percent=_guess_discount(card_text),
         )
+
+    # 4. Safety net: If the new method fails, use the old method but climb fewer levels
+    if not deals:
+        anchors = page.query_selector_all('a[href*="/dp/"], a[href*="/gp/product/"]')
+        for anchor in anchors:
+            if len(deals) >= max_deals:
+                break
+            href = anchor.get_attribute("href") or ""
+            match = ASIN_RE.search(href)
+            if not match:
+                continue
+            asin = match.group(1)
+            if asin in deals:
+                continue
+
+            # Changed from 6 to 4 to prevent grabbing whole carousels on India's layout
+            context = anchor.evaluate(_CLIMB_TO_CARD_JS, 4)
+            card_text = context.get("text", "")
+            image_url = context.get("image", "")
+
+            full_url = href if href.startswith("http") else f"https://www.{domain}{href}"
+            deals[asin] = Deal(
+                asin=asin,
+                title=_guess_title(card_text, anchor),
+                url=full_url,
+                image_url=image_url,
+                current_price=_guess_current_price(card_text),
+                original_price=_guess_original_price(card_text),
+                discount_percent=_guess_discount(card_text),
+            )
 
     return list(deals.values())
 
