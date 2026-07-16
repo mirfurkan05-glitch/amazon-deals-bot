@@ -81,20 +81,13 @@ def scrape_deals(domain: str = "amazon.com", max_deals: int = 20, headless: bool
 
 def _extract_deals(page, domain: str, max_deals: int) -> list[Deal]:
     deals: dict[str, Deal] = {}
-    seen_content: set[str] = set() # Track unique visual layout
     
-    cards = page.query_selector_all('[data-testid="deal-card"]')
-    if not cards:
-        cards = page.query_selector_all('div[class*="DealGridItem"]')
-
-    for card in cards:
+    anchors = page.query_selector_all('a[href*="/dp/"], a[href*="/gp/product/"]')
+    
+    for anchor in anchors:
         if len(deals) >= max_deals:
             break
-
-        anchor = card.query_selector('a[href*="/dp/"], a[href*="/gp/product/"]')
-        if not anchor:
-            continue
-
+            
         href = anchor.get_attribute("href") or ""
         match = ASIN_RE.search(href)
         if not match:
@@ -104,15 +97,10 @@ def _extract_deals(page, domain: str, max_deals: int) -> list[Deal]:
         if asin in deals:
             continue
 
-        card_text = card.inner_text()
-        img_element = card.query_selector('img')
-        image_url = img_element.get_attribute("src") if img_element else ""
-
-        # SAFETY FILTER: If we've already seen this exact image or discount layout in this run, skip it
-        discount = _guess_discount(card_text)
-        content_fingerprint = f"{image_url}_{discount}"
-        if content_fingerprint in seen_content:
-            continue
+        # Climb 4 levels (instead of 6) to grab the specific item box, not the whole row
+        context = anchor.evaluate(_CLIMB_TO_CARD_JS, 4)
+        card_text = context.get("text", "")
+        image_url = context.get("image", "")
 
         full_url = href if href.startswith("http") else f"https://www.{domain}{href}"
         
@@ -123,44 +111,8 @@ def _extract_deals(page, domain: str, max_deals: int) -> list[Deal]:
             image_url=image_url,
             current_price=_guess_current_price(card_text),
             original_price=_guess_original_price(card_text),
-            discount_percent=discount,
+            discount_percent=_guess_discount(card_text),
         )
-        seen_content.add(content_fingerprint)
-
-    # Safety net fallback
-    if not deals:
-        anchors = page.query_selector_all('a[href*="/dp/"], a[href*="/gp/product/"]')
-        for anchor in anchors:
-            if len(deals) >= max_deals:
-                break
-            href = anchor.get_attribute("href") or ""
-            match = ASIN_RE.search(href)
-            if not match:
-                continue
-            asin = match.group(1)
-            if asin in deals:
-                continue
-
-            context = anchor.evaluate(_CLIMB_TO_CARD_JS, 4)
-            card_text = context.get("text", "")
-            image_url = context.get("image", "")
-
-            discount = _guess_discount(card_text)
-            content_fingerprint = f"{image_url}_{discount}"
-            if content_fingerprint in seen_content:
-                continue
-
-            full_url = href if href.startswith("http") else f"https://www.{domain}{href}"
-            deals[asin] = Deal(
-                asin=asin,
-                title=_guess_title(card_text, anchor),
-                url=full_url,
-                image_url=image_url,
-                current_price=_guess_current_price(card_text),
-                original_price=_guess_original_price(card_text),
-                discount_percent=discount,
-            )
-            seen_content.add(content_fingerprint)
 
     return list(deals.values())
 
