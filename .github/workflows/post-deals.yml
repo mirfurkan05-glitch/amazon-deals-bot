@@ -1,0 +1,42 @@
+name: Post Amazon Deals to Telegram
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"  # every 4 hours — adjust to taste
+  workflow_dispatch: {}     # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write  # needed to commit the updated posted-deals log back to the repo
+
+jobs:
+  post-deals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          AMAZON_ASSOCIATE_TAG: ${{ secrets.AMAZON_ASSOCIATE_TAG }}
+          AMAZON_DOMAIN: ${{ vars.AMAZON_DOMAIN || 'amazon.com' }}
+          MAX_DEALS_PER_RUN: ${{ vars.MAX_DEALS_PER_RUN || '5' }}
+          MIN_DISCOUNT_PERCENT: ${{ vars.MIN_DISCOUNT_PERCENT || '20' }}
+        run: python src/main.py
+
+      - name: Commit updated posted-deals log
+        run: |
+          git config user.name "amazon-deals-bot"
+          git config user.email "actions@github.com"
+          git add data/posted_deals.json
+          git diff --staged --quiet || git commit -m "Update posted deals log [skip ci]"
+          git push
