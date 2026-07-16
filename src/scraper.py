@@ -70,7 +70,7 @@ def scrape_deals(domain: str = "amazon.com", max_deals: int = 20, headless: bool
         try:
             context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1366, "height": 900})
             page = context.new_page()
-            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2500)  # let lazy-loaded tiles settle
             page.mouse.wheel(0, 3000)  # trigger scroll-triggered lazy loads
             page.wait_for_timeout(1500)
