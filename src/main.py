@@ -58,7 +58,8 @@ def main() -> None:
     new_deals = [
         d for d in deals
         if d.asin not in posted
-        and (d.discount_percent is None or d.discount_percent >= min_discount)
+        and d.discount_percent is not None
+        and d.discount_percent >= min_discount
     ][:max_per_run]
     print(f"{len(new_deals)} new deal(s) to post (min discount {min_discount}%).")
 
