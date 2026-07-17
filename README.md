@@ -77,7 +77,7 @@ to override defaults without touching code:
 
 | Name | Default | Meaning |
 |---|---|---|
-| `AMAZON_DOMAIN` | `amazon.com` | which marketplace to scrape |
+| `AMAZON_DOMAIN` | `amazon.com` | which marketplace to scrape, e.g. `amazon.in`, `amazon.co.uk`, `amazon.de` |
 | `MAX_DEALS_PER_RUN` | `5` | cap on posts per run |
 | `MIN_DISCOUNT_PERCENT` | `20` | skip deals below this % off |
 
@@ -129,10 +129,44 @@ falls back to a text-only post, so check your Action logs for the actual
 error.
 
 **Duplicate posts**
-Means `data/posted_deals.json` didn't get committed after a run — check
-that the workflow has `permissions: contents: write` (it does by
-default in this repo) and that the commit step isn't failing silently in
-your Action logs.
+Almost always means `data/posted_deals.json` isn't actually getting
+committed back after each run, so every run starts from the same "nothing
+posted yet" state. Two things to check, in order:
+1. Open the **Actions** tab → a recent run → the "Commit updated
+   posted-deals log" step. If it's failing (not just the git commands
+   printing "nothing to commit"), go to **Settings → Actions → General →
+   Workflow permissions** and make sure **"Read and write permissions"**
+   is selected. This repo's workflow file requests write access, but that
+   request is capped by this repo-level setting — if it's set to
+   read-only, the `git push` fails with a permissions error even though
+   the YAML looks correct.
+2. If you triggered several manual runs close together while testing,
+   they can race and both post before either commits. The workflow
+   includes a `concurrency` group specifically to queue overlapping runs
+   instead — confirm you're running the latest version of
+   `.github/workflows/post-deals.yml`.
+
+If posts look like literal duplicates of the *same* title/price on every
+run even with the above both fine, you may be looking at the currency
+bug described below rather than a persistence issue.
+
+**Wrong currency, missing prices, or "duplicate-looking" posts on a
+non-US marketplace (e.g. `amazon.in`)**
+The original version of this scraper only recognized `$`-formatted
+prices, so on marketplaces like India that use `₹` (and often no decimal
+places, e.g. `₹1,299` rather than `₹1,299.00`), it found zero prices at
+all. That had a second effect: the DOM-climbing logic uses "found a
+price" as its signal to stop climbing toward the product's card
+container — with no match possible, it always climbed the maximum
+distance, which on some layouts pulls in a shared ancestor across
+multiple different products, making genuinely different ASINs come out
+with the same extracted title text. That looks exactly like duplicate
+posts even though the underlying products (and dedup tracking) were
+actually distinct. This is fixed as of the current `scraper.py` — prices
+are matched per-marketplace via the `CURRENCY_SYMBOL` map at the top of
+the file. If you're scraping a marketplace not already listed there
+(anything beyond `.com`, `.in`, `.co.uk`, `.ca`, `.com.au`, `.de`, `.fr`,
+`.it`, `.es`), add its symbol to that map.
 
 ## Project structure
 ```
