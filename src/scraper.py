@@ -116,7 +116,27 @@ def scrape_deals(domain: str = "amazon.com", max_deals: int = 20, headless: bool
         try:
             context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1366, "height": 900})
             page = context.new_page()
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            # "networkidle" (waiting for zero in-flight requests for 500ms)
+            # is a bad fit for a page like Amazon's /deals: it keeps
+            # background requests going almost continuously -- analytics
+            # beacons, ad pixels, recommendation widgets refreshing -- so on
+            # a slower connection (shared CI runners in particular) it can
+            # go the full timeout without ever going idle, even though the
+            # actual deal content loaded within a few seconds. "domcontentloaded"
+            # only waits for the initial HTML, which is faster and more
+            # reliable, and then we wait for something concrete -- an actual
+            # product link -- to confirm the page really did render deals,
+            # rather than waiting for a network condition that may never occur.
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_selector('a[href*="/dp/"], a[href*="/gp/product/"]', timeout=20000)
+            except Exception:
+                # Page loaded but no product links showed up in time -- don't
+                # crash the whole run over this. Fall through and let
+                # _extract_deals return an empty list; main.py already
+                # handles "0 deals found" as a normal (non-fatal) outcome,
+                # and this run will just retry on the next schedule.
+                pass
             page.wait_for_timeout(2500)  # let lazy-loaded tiles settle
             page.mouse.wheel(0, 3000)  # trigger scroll-triggered lazy loads
             page.wait_for_timeout(1500)
