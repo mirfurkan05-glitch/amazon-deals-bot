@@ -203,41 +203,52 @@ def scrape_deals(domain: str = "amazon.com", max_deals: int = 20, headless: bool
             browser.close()
 
 
-def _extract_deals(page, domain: str, max_deals: int, price_re: re.Pattern) -> list[Deal]:
+def _extract_deals(page, domain: str, max_deals: int) -> list[Deal]:
     deals: dict[str, Deal] = {}
-    anchors = page.query_selector_all('a[href*="/dp/"], a[href*="/gp/product/"]')
+    seen_fingerprints: set[str] = set() # Our new aggressive filter
 
+    anchors = page.query_selector_all('a[href*="/dp/"], a[href*="/gp/product/"]')
+    
     for anchor in anchors:
         if len(deals) >= max_deals:
             break
-
+            
         href = anchor.get_attribute("href") or ""
         match = ASIN_RE.search(href)
         if not match:
             continue
+            
         asin = match.group(1)
-        if asin in deals:
+
+        context = anchor.evaluate(_CLIMB_TO_CARD_JS, 4)
+        card_text = context.get("text", "")
+        image_url = context.get("image", "")
+
+        # Extract title and price early to check them
+        title = _guess_title(card_text, anchor)
+        current_price = _guess_current_price(card_text)
+
+        # THE FIX: Create a "fingerprint" using the first 30 characters of the title + the price. 
+        # This completely ignores ASINs and Image URLs, stopping Amazon's trickery.
+        fingerprint = f"{title[:30]}_{current_price}"
+
+        if fingerprint in seen_fingerprints or asin in deals:
             continue
 
-        context = anchor.evaluate(_CLIMB_TO_CARD_JS, {"maxLevels": 6, "pricePattern": price_re.pattern})
-        card_text = context.get("text", "")
-        struck_flags = context.get("struckFlags", [])
-        hidden_flags = context.get("hiddenFlags", [])
-        image_url = context.get("image", "")
-        lines = card_text.split("\n")
-
-        current_price, original_price = _extract_price_pair(lines, struck_flags, hidden_flags, price_re)
-
         full_url = href if href.startswith("http") else f"https://www.{domain}{href}"
+        
         deals[asin] = Deal(
             asin=asin,
-            title=_guess_title(card_text, anchor, price_re),
+            title=title,
             url=full_url,
             image_url=image_url,
             current_price=current_price,
-            original_price=original_price,
-            discount_percent=_guess_discount(card_text, current_price, original_price),
+            original_price=_guess_original_price(card_text),
+            discount_percent=_guess_discount(card_text),
         )
+        
+        # Add the fingerprint to our tracking list
+        seen_fingerprints.add(fingerprint)
 
     return list(deals.values())
 
