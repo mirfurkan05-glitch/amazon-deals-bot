@@ -181,7 +181,11 @@ def scrape_deals(domain: str = "amazon.com", max_deals: int = 20, headless: bool
             # reliable, and then we wait for something concrete -- an actual
             # product link -- to confirm the page really did render deals,
             # rather than waiting for a network condition that may never occur.
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                print(f"Amazon blocked the page load (Download Error): {e}")
+                return []  # Gracefully return 0 deals and let the bot try again next time
             try:
                 page.wait_for_selector('a[href*="/dp/"], a[href*="/gp/product/"]', timeout=20000)
             except Exception:
