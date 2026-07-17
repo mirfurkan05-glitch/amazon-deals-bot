@@ -160,6 +160,35 @@ def _price_regex(domain: str) -> re.Pattern:
     # decimals optional — Indian rupee prices routinely omit them
     return re.compile(rf'{symbol}\s?[\d,]+(?:\.\d{{1,2}})?')
 
+def scrape_deals(domain: str = "amazon.com", max_deals: int = 20, headless: bool = True) -> list[Deal]:
+    url = f"https://www.{domain}/deals"
+    price_re = _price_regex(domain)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        try:
+            context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1366, "height": 900})
+            page = context.new_page()
+            
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                print(f"Amazon blocked the page load (Download Error): {e}")
+                return [] 
+                
+            try:
+                page.wait_for_selector('a[href*="/dp/"], a[href*="/gp/product/"]', timeout=20000)
+            except Exception:
+                pass
+                
+            page.wait_for_timeout(2500)  # let lazy-loaded tiles settle
+            page.mouse.wheel(0, 3000)  # trigger scroll-triggered lazy loads
+            page.wait_for_timeout(1500)
+            
+            return _extract_deals(page, domain, max_deals, price_re)
+        finally:
+            browser.close()
+
 
 def _extract_deals(page, domain: str, max_deals: int, price_re=None) -> list[Deal]:
     url = f"https://www.{domain}/deals"
