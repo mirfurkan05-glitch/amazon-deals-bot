@@ -60,30 +60,84 @@ FALLBACK_SYMBOL_CLASS = r"[₹$£€]"
 # numbers together ("$19.99$39.99" + "50%" -> a stray "950%" match). Instead
 # we walk individual text nodes and join them with newlines, so each
 # element's text is always isolated on its own line.
+#
+# We also tag each line with whether the text node's nearest ancestor is
+# struck-through or visually hidden. Amazon marks the "was" price two
+# different ways at once — a strikethrough span for sighted users, and a
+# separate visually-hidden ("a-offscreen"-style) span carrying the same
+# number again for screen readers — and both of those land in the card's
+# text alongside the plain current price. Positional guessing ("2nd price
+# found = original") can't tell those apart from a same-valued duplicate of
+# the CURRENT price, which is what produced "was 1,899.00, now 1,899 (44%
+# off)": the offscreen echo of the current price got mistaken for the
+# original. Tagging strikethrough/hidden lets us identify the original
+# price by how it's marked up, not by where it happens to sit in the text.
 _CLIMB_TO_CARD_JS = """
 (el, args) => {
     const priceRe = new RegExp(args.pricePattern);
 
-    function extractText(node) {
+    function isStruckThrough(node) {
+        let n = node;
+        for (let i = 0; i < 6 && n; i++) {
+            if (n.nodeType === 1) {
+                const style = window.getComputedStyle(n);
+                if (style.textDecorationLine && style.textDecorationLine.includes('line-through')) return true;
+                const cls = n.className || '';
+                if (typeof cls === 'string' && /strike|was-?price|line-?through/i.test(cls)) return true;
+                const tag = n.tagName;
+                if (tag === 'S' || tag === 'DEL' || tag === 'STRIKE') return true;
+            }
+            n = n.parentElement;
+        }
+        return false;
+    }
+
+    function isVisuallyHidden(node) {
+        let n = node;
+        for (let i = 0; i < 6 && n; i++) {
+            if (n.nodeType === 1) {
+                const style = window.getComputedStyle(n);
+                if (style.position === 'absolute' && (style.width === '1px' || style.clip !== 'auto')) return true;
+                const cls = n.className || '';
+                if (typeof cls === 'string' && /offscreen|sr-only|visually-?hidden|screen-?reader/i.test(cls)) return true;
+            }
+            n = n.parentElement;
+        }
+        return false;
+    }
+
+    function extractLines(node) {
         const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
         const lines = [];
         let t;
         while (t = walker.nextNode()) {
             const trimmed = t.textContent.trim();
-            if (trimmed) lines.push(trimmed);
+            if (!trimmed) continue;
+            lines.push({
+                text: trimmed,
+                struck: isStruckThrough(t.parentElement),
+                hidden: isVisuallyHidden(t.parentElement)
+            });
         }
-        return lines.join('\\n');
+        return lines;
     }
 
     let node = el;
     for (let i = 0; i < args.maxLevels; i++) {
         if (!node.parentElement) break;
         node = node.parentElement;
-        if (priceRe.test(extractText(node))) break;
+        const joined = extractLines(node).map(l => l.text).join('\\n');
+        if (priceRe.test(joined)) break;
     }
+    const lines = extractLines(node);
     const img = node.querySelector('img');
     return {
-        text: extractText(node),
+        text: lines.map(l => l.text).join('\\n'),
+        // Parallel array instead of nested objects: keeps the Python side
+        // simple (zip text.split('\\n') with this) and avoids relying on
+        // JSON key order across the Playwright JS<->Python boundary.
+        struckFlags: lines.map(l => l.struck),
+        hiddenFlags: lines.map(l => l.hidden),
         image: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : ''
     };
 }
@@ -163,7 +217,12 @@ def _extract_deals(page, domain: str, max_deals: int, price_re: re.Pattern) -> l
 
         context = anchor.evaluate(_CLIMB_TO_CARD_JS, {"maxLevels": 6, "pricePattern": price_re.pattern})
         card_text = context.get("text", "")
+        struck_flags = context.get("struckFlags", [])
+        hidden_flags = context.get("hiddenFlags", [])
         image_url = context.get("image", "")
+        lines = card_text.split("\n")
+
+        current_price, original_price = _extract_price_pair(lines, struck_flags, hidden_flags, price_re)
 
         full_url = href if href.startswith("http") else f"https://www.{domain}{href}"
         deals[asin] = Deal(
@@ -171,9 +230,9 @@ def _extract_deals(page, domain: str, max_deals: int, price_re: re.Pattern) -> l
             title=_guess_title(card_text, anchor, price_re),
             url=full_url,
             image_url=image_url,
-            current_price=_guess_current_price(card_text, price_re),
-            original_price=_guess_original_price(card_text, price_re),
-            discount_percent=_guess_discount(card_text),
+            current_price=current_price,
+            original_price=original_price,
+            discount_percent=_guess_discount(card_text, current_price, original_price),
         )
 
     return list(deals.values())
@@ -190,16 +249,175 @@ def _guess_title(card_text: str, anchor, price_re: re.Pattern) -> str:
     return "Amazon deal"
 
 
-def _guess_current_price(text: str, price_re: re.Pattern) -> str:
-    prices = price_re.findall(text)
-    return prices[0] if prices else ""
+def _price_value(price_str: str) -> Optional[float]:
+    """Parse '₹1,899.00' / '$19.99' -> 1899.0 / 19.99, for value comparison."""
+    digits = re.sub(r"[^\d.]", "", price_str)
+    if not digits:
+        return None
+    try:
+        return float(digits)
+    except ValueError:
+        return None
 
 
-def _guess_original_price(text: str, price_re: re.Pattern) -> Optional[str]:
-    prices = price_re.findall(text)
-    return prices[1] if len(prices) > 1 else None
+def _extract_price_pair(
+    lines: list[str],
+    struck_flags: list,
+    hidden_flags: list,
+    price_re: re.Pattern,
+) -> tuple[str, Optional[str]]:
+    """
+    Find the current price and, if present, the original (pre-discount) price.
+
+    Amazon typically renders the "was" price TWICE at once: a strikethrough
+    span for sighted users, and a separate visually-hidden span repeating
+    the same number for screen readers (a plain strikethrough has no
+    semantic meaning to assistive tech, so it needs a text equivalent).
+    Both of those end up as separate lines in the card's extracted text
+    alongside the plain current price -- so a card with an active discount
+    commonly has price text appearing three times: current, original
+    (struck), original (hidden), not two. Treating "whichever price text
+    comes second" as the original -- the previous behavior -- can grab the
+    hidden echo of the CURRENT price instead, producing a "was 1,899.00,
+    now 1,899 (44% off)" pair that's really the same price rendered twice.
+
+    A separate, related issue this also has to handle: a real, VISIBLE
+    struck-through price that just happens to equal the current price (e.g.
+    Amazon showing an MRP-strikethrough out of habit on a listing with no
+    actual discount) shouldn't count as an original price either -- an
+    "original" that isn't actually different from the current price isn't
+    a real discount pair, whether the duplicate is hidden or visible.
+
+    Strategy:
+      1. Collect every (value, is_struck, is_hidden) price found in the
+         card, deduping by numeric value+struck-state so the visible and
+         hidden renderings of the SAME price collapse into one entry
+         instead of being treated as two different prices.
+      2. Current price = the one price that's neither struck-through nor
+         hidden-only (or the smallest deduped value, when everything is
+         plain and there's no discount markup at all).
+      3. Original price = a struck-through value that DIFFERS from the
+         current price. If nothing is marked as struck-through (some
+         layouts may only expose the hidden copy, or none), fall back to
+         "largest remaining distinct value", since the pre-discount price
+         is always >= the current price -- position in the text is NOT
+         used as a signal, since that's exactly what broke before. Either
+         way, a same-valued "original" is never reported.
+    """
+    # (value, struck) -> best entry seen so far for that combination.
+    # "Best" means visible over hidden: when a price's value+struck-state
+    # collides with one we've already recorded, we only replace the kept
+    # entry if the new one is visible and the kept one was hidden-only.
+    # This makes the dedupe order-independent -- otherwise, if the hidden
+    # a11y echo happens to appear in the DOM before the visible price, a
+    # simple "first one wins" dedupe would keep the hidden one and drop the
+    # visible one, which is just the same bug moved to a different spot.
+    best_by_key: dict[tuple, tuple] = {}
+    for i, line in enumerate(lines):
+        m = price_re.search(line)
+        if not m:
+            continue
+        raw = m.group(0)
+        value = _price_value(raw)
+        if value is None:
+            continue
+        struck = bool(struck_flags[i]) if i < len(struck_flags) else False
+        hidden = bool(hidden_flags[i]) if i < len(hidden_flags) else False
+        key = (value, struck)
+        existing = best_by_key.get(key)
+        if existing is None or (existing[3] and not hidden):
+            best_by_key[key] = (raw, value, struck, hidden)
+    entries = list(best_by_key.values())
+
+    if not entries:
+        return "", None
+
+    struck_entries = [e for e in entries if e[2]]
+    plain_entries = [e for e in entries if not e[2]]
+
+    # Current price: prefer a plain (non-struck) entry that isn't ONLY a
+    # hidden duplicate; a card always renders the current price visibly
+    # somewhere, so a visible-and-plain entry should exist when there IS
+    # a discount. Without one, just take the smallest plain value.
+    current_candidates = [e for e in plain_entries if not e[3]] or plain_entries
+    if current_candidates:
+        current = min(current_candidates, key=lambda e: e[1])
+    else:
+        # Nothing plain at all (unusual) -- fall back to the smallest
+        # overall value rather than returning nothing.
+        current = min(entries, key=lambda e: e[1])
+
+    remaining = [e for e in entries if e[1] != current[1]]
+    if not remaining:
+        return current[0], None
+
+    if struck_entries:
+        original_pool = [e for e in struck_entries if e[1] != current[1]]
+    else:
+        # No strikethrough markup detected on this layout -- fall back to
+        # "largest distinct value", since a real original price can only
+        # ever be >= the current price. This still avoids the old bug:
+        # a same-valued hidden echo of the current price was already
+        # excluded by the value-based dedupe above, so it can't win here.
+        original_pool = remaining
+
+    if not original_pool:
+        return current[0], None
+
+    original = max(original_pool, key=lambda e: e[1])
+    if original[1] <= current[1]:
+        # Safety net: an "original" that isn't actually higher than the
+        # current price isn't a real discount pair -- don't report one.
+        return current[0], None
+
+    return current[0], original[0]
 
 
-def _guess_discount(text: str) -> Optional[int]:
+def _guess_discount(text: str, current_price: str, original_price: Optional[str]) -> Optional[int]:
+    """
+    Figure out the discount percentage to show, if any.
+
+    IMPORTANT: this must stay consistent with whatever _extract_price_pair
+    decided, not just search the card's raw text in isolation. Amazon cards
+    frequently carry a percent-off badge ("46% off", a 🔥 ribbon, etc.) as a
+    generic promotional element that can be present even when there's no
+    genuine gap between current and original price on THIS listing -- e.g.
+    a coupon or bank-offer badge, or an MRP-strikethrough that Amazon shows
+    out of habit even though MRP happens to equal the selling price. If we
+    trust that badge text unconditionally, we can end up captioning a post
+    with "was ₹1,290.00, now ₹1,290 (46% off)" -- a real percent number,
+    just not one that describes an actual price difference on this card.
+
+    So: if we don't have a confirmed original_price (i.e.
+    _extract_price_pair already decided there's no real discount pair --
+    including cases where a struck-through price exists but equals the
+    current price), we don't report ANY discount percentage, even if the
+    text contains one. A percent badge with no corresponding price gap
+    isn't something this bot can respond to responsibly, since we have no
+    way to tell a real per-item discount apart from a bank-offer/coupon
+    promo without visiting the product page ourselves.
+    """
+    if not original_price:
+        return None
+
+    cur = _price_value(current_price)
+    orig = _price_value(original_price)
+    if cur is None or not orig or orig <= 0:
+        return None
+    computed = round((1 - cur / orig) * 100)
+    if computed <= 0:
+        return None
+
+    # If the card also has explicit "X% off" text AND it's reasonably close
+    # to the price-derived number, prefer the card's own stated figure
+    # (Amazon sometimes rounds slightly differently than a raw price-ratio
+    # calculation would). "Reasonably close" is deliberately tight -- this
+    # is a sanity check the two numbers roughly agree, not a way to let an
+    # unrelated badge override a real price-derived computation.
     match = PERCENT_RE.search(text)
-    return int(match.group(1)) if match else None
+    if match:
+        stated = int(match.group(1))
+        if abs(stated - computed) <= 3:
+            return stated
+
+    return computed
