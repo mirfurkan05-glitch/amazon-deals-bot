@@ -17,9 +17,9 @@ def escape_html(text: str) -> str:
 def format_caption(deal, affiliate_url: str) -> str:
     lines = [f"🔥 <b>{escape_html(deal.title)}</b>", ""]
 
-    if deal.original_price and deal.discount_percent:
+    if deal.discount_percent and deal.current_price:
+        # This line now only posts the current price and the discount percentage
         lines.append(
-            f"<s>{escape_html(deal.original_price)}</s> → "
             f"<b>{escape_html(deal.current_price)}</b> "
             f"({deal.discount_percent}% off)"
         )
@@ -27,7 +27,7 @@ def format_caption(deal, affiliate_url: str) -> str:
         lines.append(f"<b>{escape_html(deal.current_price)}</b>")
 
     lines.append("")
-    lines.append(f'<a href="{affiliate_url}">👉 Grab this deal on Amazon</a>')
+    lines.append(f'<a href="{affiliate_url}">⚡ Claim this discount on Amazon</a>')
     return "\n".join(lines)
 
 
