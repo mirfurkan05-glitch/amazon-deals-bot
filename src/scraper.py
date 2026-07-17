@@ -161,7 +161,7 @@ def _price_regex(domain: str) -> re.Pattern:
     return re.compile(rf'{symbol}\s?[\d,]+(?:\.\d{{1,2}})?')
 
 
-def scrape_deals(domain: str = "amazon.com", max_deals: int = 20, headless: bool = True) -> list[Deal]:
+def def _extract_deals(page, domain: str, max_deals: int, price_re=None) -> list[Deal]:
     url = f"https://www.{domain}/deals"
     price_re = _price_regex(domain)
 
